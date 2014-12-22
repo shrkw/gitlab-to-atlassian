@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # License: BSD 3 clause
-'''
+"""
 Clone all projects from GitLab and recreate them on Stash
 
 :author: Dan Blanchard (dblanchard@ets.org)
 :organization: ETS
 :date: June 2014
-'''
+"""
 
 import argparse
 import getpass
@@ -18,17 +18,17 @@ import sys
 import tempfile
 
 import stashy
-from gitlab import Gitlab as GitLab
+from gitlab import Gitlab as GitLabAPI
 
 
 __version__ = '0.1.0'
 
 
 def gen_all_results(method, *args, per_page=20, **kwargs):
-    '''
+    """
     Little helper function to generate all pages of results for a given method
     in one list.
-    '''
+    """
     get_more = True
     page_num = 0
     if 'page' in kwargs:
@@ -47,20 +47,20 @@ def gen_all_results(method, *args, per_page=20, **kwargs):
 def setup(args):
     # Setup authenticated GitLab and Stash instances
     if args.token:
-        glab = GitLab(args.gitlab_url, token=args.token,
+        gitlab = GitLabAPI(args.gitlab_url, token=args.token,
                       verify_ssl=args.verify_ssl)
     else:
-        glab = None
+        gitlab = None
     if not args.username:
         print('Username: ', end="", file=sys.stderr)
         args.username = input('').strip()
     if not args.password:
         args.password = getpass.getpass('Password: ')
     stash = stashy.connect(args.stash_url, args.username, args.password)
-    if glab is None:
-        glab = GitLab(args.gitlab_url, verify_ssl=args.verify_ssl)
-        glab.login(args.username, args.password)
-    return glab, stash
+    if gitlab is None:
+        gitlab = GitLabAPI(args.gitlab_url, verify_ssl=args.verify_ssl)
+        gitlab.login(args.username, args.password)
+    return gitlab, stash
 
 
 def parse_args(argv):
@@ -180,7 +180,7 @@ def create_stash_repo_if_not_exist(args, proj_name, repo_name, repo_to_slugs, sk
     return skipped_count, stash_repo
 
 
-def push_to_stash(failed_to_clone, g_lab_proj, skipped_count, stash_repo_url, transfer_count):
+def push_to_stash(failed_to_clone, gitlab_proj, skipped_count, stash_repo_url, transfer_count):
     with tempfile.TemporaryDirectory() as temp_dir:
         cwd = os.getcwd()
         # Clone repository to temporary directory
@@ -188,12 +188,12 @@ def push_to_stash(failed_to_clone, g_lab_proj, skipped_count, stash_repo_url, tr
         sys.stderr.flush()
         try:
             subprocess.check_call(['git', 'clone', '--mirror',
-                                   g_lab_proj['ssh_url_to_repo'],
+                                   gitlab_proj['ssh_url_to_repo'],
                                    temp_dir])
         except subprocess.CalledProcessError:
             print('Failed to clone GitLab repository. This usually when ' +
                   'it does not exist.', file=sys.stderr)
-            failed_to_clone.add(g_lab_proj['name_with_namespace'])
+            failed_to_clone.add(gitlab_proj['name_with_namespace'])
             skipped_count += 1
             return skipped_count, transfer_count
         os.chdir(temp_dir)
@@ -221,13 +221,14 @@ def push_to_stash(failed_to_clone, g_lab_proj, skipped_count, stash_repo_url, tr
 
 
 def main(argv=None):
-    '''
+    """
     Process the command line arguments and create the JSON dump.
 
     :param argv: List of arguments, as if specified on the command-line.
                  If None, ``sys.argv[1:]`` is used instead.
     :type argv: list of str
-    '''
+    """
+
     args = parse_args(argv)
 
     # Convert verbose flag to actually logging level
@@ -238,7 +239,7 @@ def main(argv=None):
     logging.basicConfig(format=('%(asctime)s - %(name)s - %(levelname)s - ' +
                                 '%(message)s'), level=log_level)
 
-    g_lab, stash = setup(args)
+    gitlab, stash = setup(args)
 
     print('Retrieving existing Stash projects...', end="", file=sys.stderr)
     sys.stderr.flush()
@@ -256,11 +257,11 @@ def main(argv=None):
     print('Processing GitLab projects...', file=sys.stderr)
     sys.stderr.flush()
 
-    for g_lab_proj in gen_all_results(g_lab.getallprojects,
-                                   per_page=args.page_size):
+    for gitlab_proj in gen_all_results(gitlab.getallprojects,
+                                      per_page=args.page_size):
         print('\n' + ('=' * 80) + '\n', file=sys.stderr)
         sys.stderr.flush()
-        proj_name = g_lab_proj['namespace']['name']
+        proj_name = gitlab_proj['namespace']['name']
         stash_proj_key = get_or_create_stash_proj_key(key_set, names_to_keys, proj_name, stash, stash_project_names)
 
         stash_project = stash.projects[stash_proj_key]
@@ -273,23 +274,23 @@ def main(argv=None):
         # Repository names are limited to 128 characters.
         # They must start with a letter or number and may contain spaces,
         # hyphens, underscores and periods
-        repo_name = round_to_stash_repo_name(g_lab_proj['name'])
+        repo_name = round_to_stash_repo_name(gitlab_proj['name'])
 
         skipped_count, stash_repo = create_stash_repo_if_not_exist(args, proj_name, repo_name, repo_to_slugs,
                                                                    skipped_count, stash_proj_key, stash_project)
         if stash_repo is None:
             continue
 
+        stash_repo_url = ""
         for clone_link in stash_repo['links']['clone']:
             if clone_link['name'] == 'ssh':
                 stash_repo_url = clone_link['href']
                 break
 
-        skipped_count, transfer_count = push_to_stash(failed_to_clone, g_lab_proj, skipped_count, stash_repo_url,
+        skipped_count, transfer_count = push_to_stash(failed_to_clone, gitlab_proj, skipped_count, stash_repo_url,
                                                       transfer_count)
 
         updated_projects.add(proj_name)
-
 
     print('\n' + ('=' * 35) + 'SUMMARY' + ('=' * 35), file=sys.stderr)
     print('{} repositories transferred.\n'.format(transfer_count),
