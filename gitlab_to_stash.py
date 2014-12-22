@@ -44,14 +44,26 @@ def gen_all_results(method, *args, per_page=20, **kwargs):
             get_more = False
 
 
-def main(argv=None):
-    '''
-    Process the command line arguments and create the JSON dump.
+def setup(args):
+    # Setup authenticated GitLab and Stash instances
+    if args.token:
+        glab = GitLab(args.gitlab_url, token=args.token,
+                      verify_ssl=args.verify_ssl)
+    else:
+        glab = None
+    if not args.username:
+        print('Username: ', end="", file=sys.stderr)
+        args.username = input('').strip()
+    if not args.password:
+        args.password = getpass.getpass('Password: ')
+    stash = stashy.connect(args.stash_url, args.username, args.password)
+    if glab is None:
+        glab = GitLab(args.gitlab_url, verify_ssl=args.verify_ssl)
+        glab.login(args.username, args.password)
+    return glab, stash
 
-    :param argv: List of arguments, as if specified on the command-line.
-                 If None, ``sys.argv[1:]`` is used instead.
-    :type argv: list of str
-    '''
+
+def parse_args(argv):
     # Get command line arguments
     parser = argparse.ArgumentParser(
         description="Transfer all projects/repositories from GitLab to Stash. \
@@ -94,8 +106,129 @@ def main(argv=None):
     parser.add_argument('--version', action='version',
                         version='%(prog)s {0}'.format(__version__))
     args = parser.parse_args(argv)
-
     args.page_size = max(100, args.page_size)
+    return args
+
+
+def get_or_create_stash_proj_key(key_set, names_to_keys, proj_name, stash, stash_project_names):
+    # Create Stash project if it doesn't already exist
+    if proj_name not in stash_project_names:
+        # Create Stash project key
+        key = proj_name
+        if key.islower():
+            key = key.title()
+        key = re.sub(r'[^A-Z]', '', key)
+        if len(key) < 2:
+            key = re.sub(r'[^A-Za-z]', '', proj_name)[0:2].upper()
+        added = False
+        suffix = 65
+        while key in key_set:
+            if not added:
+                key += 'A'
+            else:
+                suffix += 1
+                key = key[:-1] + chr(suffix)
+        key_set.add(key)
+
+        # Actually add the project to Stash
+        print('Creating Stash project "%s" with key %s...' %
+              (proj_name, key), end="", file=sys.stderr)
+        sys.stderr.flush()
+        stash.projects.create(key, proj_name)
+        names_to_keys[proj_name] = key
+        stash_project_names.add(proj_name)
+        print('done', file=sys.stderr)
+        sys.stderr.flush()
+    else:
+        key = names_to_keys[proj_name]
+    return key
+
+
+def round_to_stash_repo_name(repo_name):
+    if not repo_name[0].isalnum():
+        repo_name = 'A ' + repo_name
+    repo_name = re.sub(r'[^A-Za-z0-9 _.-]', ' ', repo_name)
+    if len(repo_name) > 128:
+        repo_name = repo_name[0:128]
+
+    return repo_name
+
+
+def create_stash_repo_if_not_exist(args, proj_name, repo_name, repo_to_slugs, skipped_count, stash_proj_key,
+                                   stash_project):
+    # Add repository to Stash project if it's not already there
+    if repo_name not in repo_to_slugs[stash_proj_key]:
+        print('Creating Stash repository "%s" in project "%s"...' %
+              (repo_name, proj_name), end="", file=sys.stderr)
+        sys.stderr.flush()
+        stash_repo = stash_project.repos.create(repo_name)
+        repo_to_slugs[stash_proj_key][repo_name] = stash_repo['slug']
+        print('done', file=sys.stderr)
+        sys.stderr.flush()
+    elif args.skip_existing:
+        print('Skipping existing Stash repository "%s" in project "%s"' %
+              (repo_name, proj_name), file=sys.stderr)
+        sys.stderr.flush()
+        skipped_count += 1
+        stash_repo = None
+    else:
+        print('Updating existing Stash repository "%s" in project "%s"' %
+              (repo_name, proj_name), file=sys.stderr)
+        sys.stderr.flush()
+        repo_slug = repo_to_slugs[stash_proj_key][repo_name]
+        stash_repo = stash_project.repos[repo_slug].get()
+    return skipped_count, stash_repo
+
+
+def push_to_stash(failed_to_clone, g_lab_proj, skipped_count, stash_repo_url, transfer_count):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cwd = os.getcwd()
+        # Clone repository to temporary directory
+        print('\nCloning GitLab repository...', file=sys.stderr)
+        sys.stderr.flush()
+        try:
+            subprocess.check_call(['git', 'clone', '--mirror',
+                                   g_lab_proj['ssh_url_to_repo'],
+                                   temp_dir])
+        except subprocess.CalledProcessError:
+            print('Failed to clone GitLab repository. This usually when ' +
+                  'it does not exist.', file=sys.stderr)
+            failed_to_clone.add(g_lab_proj['name_with_namespace'])
+            skipped_count += 1
+            return skipped_count, transfer_count
+        os.chdir(temp_dir)
+
+        # Check that repository is not empty
+        try:
+            subprocess.check_call(['git', 'log', '--format=oneline', '-1'],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            print('Repository is empty, so skipping push to Stash.',
+                  file=sys.stderr)
+            skipped_count += 1
+        else:
+            # Change remote to Stash and push
+            print('\nPushing repository to Stash...', file=sys.stderr)
+            sys.stderr.flush()
+            subprocess.check_call(['git', 'remote', 'set-url', 'origin',
+                                   stash_repo_url])
+            subprocess.check_call(['git', 'push', '--mirror'])
+            transfer_count += 1
+
+        os.chdir(cwd)
+    return skipped_count, transfer_count
+
+
+def main(argv=None):
+    '''
+    Process the command line arguments and create the JSON dump.
+
+    :param argv: List of arguments, as if specified on the command-line.
+                 If None, ``sys.argv[1:]`` is used instead.
+    :type argv: list of str
+    '''
+    args = parse_args(argv)
 
     # Convert verbose flag to actually logging level
     log_levels = [logging.WARNING, logging.INFO, logging.DEBUG]
@@ -105,21 +238,7 @@ def main(argv=None):
     logging.basicConfig(format=('%(asctime)s - %(name)s - %(levelname)s - ' +
                                 '%(message)s'), level=log_level)
 
-    # Setup authenticated GitLab and Stash instances
-    if args.token:
-        git = GitLab(args.gitlab_url, token=args.token,
-                            verify_ssl=args.verify_ssl)
-    else:
-        git = None
-    if not args.username:
-        print('Username: ', end="", file=sys.stderr)
-        args.username = input('').strip()
-    if not args.password:
-        args.password = getpass.getpass('Password: ')
-    stash = stashy.connect(args.stash_url, args.username, args.password)
-    if git is None:
-        git = GitLab(args.gitlab_url, verify_ssl=args.verify_ssl)
-        git.login(args.username, args.password)
+    g_lab, stash = setup(args)
 
     print('Retrieving existing Stash projects...', end="", file=sys.stderr)
     sys.stderr.flush()
@@ -128,130 +247,46 @@ def main(argv=None):
     names_to_keys = {proj['name']: proj['key'] for proj in stash.projects}
     print('done', file=sys.stderr)
     sys.stderr.flush()
+
     updated_projects = set()
     repo_to_slugs = {}
     failed_to_clone = set()
-    cwd = os.getcwd()
     transfer_count = 0
     skipped_count = 0
     print('Processing GitLab projects...', file=sys.stderr)
     sys.stderr.flush()
-    for project in gen_all_results(git.getallprojects,
+
+    for g_lab_proj in gen_all_results(g_lab.getallprojects,
                                    per_page=args.page_size):
         print('\n' + ('=' * 80) + '\n', file=sys.stderr)
         sys.stderr.flush()
-        proj_name = project['namespace']['name']
-        # Create Stash project if it doesn't already exist
-        if proj_name not in stash_project_names:
-            # Create Stash project key
-            key = proj_name
-            if key.islower():
-                key = key.title()
-            key = re.sub(r'[^A-Z]', '', key)
-            if len(key) < 2:
-                key = re.sub(r'[^A-Za-z]', '', proj_name)[0:2].upper()
-            added = False
-            suffix = 65
-            while key in key_set:
-                if not added:
-                    key += 'A'
-                else:
-                    suffix += 1
-                    key = key[:-1] + chr(suffix)
-            key_set.add(key)
+        proj_name = g_lab_proj['namespace']['name']
+        stash_proj_key = get_or_create_stash_proj_key(key_set, names_to_keys, proj_name, stash, stash_project_names)
 
-            # Actually add the project to Stash
-            print('Creating Stash project "%s" with key %s...' %
-                  (proj_name, key), end="", file=sys.stderr)
-            sys.stderr.flush()
-            stash.projects.create(key, proj_name)
-            names_to_keys[proj_name] = key
-            stash_project_names.add(proj_name)
-            print('done', file=sys.stderr)
-            sys.stderr.flush()
-        else:
-            key = names_to_keys[proj_name]
-
-        stash_project = stash.projects[key]
+        stash_project = stash.projects[stash_proj_key]
 
         # Initialize maping from repository names to slugs for later
-        if key not in repo_to_slugs:
-            repo_to_slugs[key] = {repo['name']: repo['slug'] for repo in
-                                  stash_project.repos}
+        if stash_proj_key not in repo_to_slugs:
+            repo_to_slugs[stash_proj_key] = {repo['name']: repo['slug'] for repo in stash_project.repos}
 
         # Create Stash-compatible name for repository
         # Repository names are limited to 128 characters.
         # They must start with a letter or number and may contain spaces,
         # hyphens, underscores and periods
-        repo_name = project['name']
-        if not repo_name[0].isalnum():
-            repo_name = 'A ' + repo_name
-        repo_name = re.sub(r'[^A-Za-z0-9 _.-]', ' ', repo_name)
-        if len(repo_name) > 128:
-            repo_name = repo_name[0:128]
+        repo_name = round_to_stash_repo_name(g_lab_proj['name'])
 
-        # Add repository to Stash project if it's not already there
-        if repo_name not in repo_to_slugs[key]:
-            print('Creating Stash repository "%s" in project "%s"...' %
-                  (repo_name, proj_name), end="", file=sys.stderr)
-            sys.stderr.flush()
-            stash_repo = stash_project.repos.create(repo_name)
-            repo_to_slugs[key][repo_name] = stash_repo['slug']
-            print('done', file=sys.stderr)
-            sys.stderr.flush()
-        elif args.skip_existing:
-            print('Skipping existing Stash repository "%s" in project "%s"' %
-                  (repo_name, proj_name), file=sys.stderr)
-            sys.stderr.flush()
-            skipped_count += 1
+        skipped_count, stash_repo = create_stash_repo_if_not_exist(args, proj_name, repo_name, repo_to_slugs,
+                                                                   skipped_count, stash_proj_key, stash_project)
+        if stash_repo is None:
             continue
-        else:
-            print('Updating existing Stash repository "%s" in project "%s"' %
-                  (repo_name, proj_name), file=sys.stderr)
-            sys.stderr.flush()
-            repo_slug = repo_to_slugs[key][repo_name]
-            stash_repo = stash_project.repos[repo_slug].get()
 
         for clone_link in stash_repo['links']['clone']:
             if clone_link['name'] == 'ssh':
                 stash_repo_url = clone_link['href']
                 break
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            # Clone repository to temporary directory
-            print('\nCloning GitLab repository...', file=sys.stderr)
-            sys.stderr.flush()
-            try:
-                subprocess.check_call(['git', 'clone', '--mirror',
-                                       project['ssh_url_to_repo'],
-                                       temp_dir])
-            except subprocess.CalledProcessError:
-                print('Failed to clone GitLab repository. This usually when ' +
-                      'it does not exist.', file=sys.stderr)
-                failed_to_clone.add(project['name_with_namespace'])
-                skipped_count += 1
-                continue
-            os.chdir(temp_dir)
-
-            # Check that repository is not empty
-            try:
-                subprocess.check_call(['git', 'log', '--format=oneline', '-1'],
-                                      stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL)
-            except subprocess.CalledProcessError:
-                print('Repository is empty, so skipping push to Stash.',
-                      file=sys.stderr)
-                skipped_count += 1
-            else:
-                # Change remote to Stash and push
-                print('\nPushing repository to Stash...', file=sys.stderr)
-                sys.stderr.flush()
-                subprocess.check_call(['git', 'remote', 'set-url', 'origin',
-                                       stash_repo_url])
-                subprocess.check_call(['git', 'push', '--mirror'])
-                transfer_count += 1
-
-            os.chdir(cwd)
+        skipped_count, transfer_count = push_to_stash(failed_to_clone, g_lab_proj, skipped_count, stash_repo_url,
+                                                      transfer_count)
 
         updated_projects.add(proj_name)
 
