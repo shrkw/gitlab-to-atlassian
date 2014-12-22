@@ -44,11 +44,11 @@ def gen_all_results(method, *args, per_page=20, **kwargs):
             get_more = False
 
 
-def setup(args):
+def init_api_instance(args):
     # Setup authenticated GitLab and Stash instances
     if args.token:
         gitlab = GitLabAPI(args.gitlab_url, token=args.token,
-                      verify_ssl=args.verify_ssl)
+                           verify_ssl=args.verify_ssl)
     else:
         gitlab = None
     if not args.username:
@@ -61,53 +61,6 @@ def setup(args):
         gitlab = GitLabAPI(args.gitlab_url, verify_ssl=args.verify_ssl)
         gitlab.login(args.username, args.password)
     return gitlab, stash
-
-
-def parse_args(argv):
-    # Get command line arguments
-    parser = argparse.ArgumentParser(
-        description="Transfer all projects/repositories from GitLab to Stash. \
-                     Note: This script assumes you have your SSH key \
-                     registered with both GitLab and Stash.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        conflict_handler='resolve')
-    parser.add_argument('gitlab_url',
-                        help='The full URL to your GitLab instance.')
-    parser.add_argument('stash_url',
-                        help='The full URL to your Stash instance.')
-    parser.add_argument('-p', '--password',
-                        help='The password to use to authenticate if token is \
-                              not specified. If password and token are both \
-                              unspecified, you will be prompted to enter a \
-                              password.')
-    parser.add_argument('-P', '--page_size',
-                        help='When retrieving result from GitLab, how many \
-                              results should be included in a given page?.',
-                        type=int, default=20)
-    parser.add_argument('-s', '--verify_ssl',
-                        help='Enable SSL certificate verification',
-                        action='store_true')
-    parser.add_argument('-S', '--skip_existing',
-                        help='Do not update existing repositories and just \
-                              skip them.',
-                        action='store_true')
-    parser.add_argument('-t', '--token',
-                        help='The private GitLab API token to use for \
-                              authentication. Either this or username and \
-                              password must be set.')
-    parser.add_argument('-u', '--username',
-                        help='The username to use for authentication, if token\
-                              is unspecified.')
-    parser.add_argument('-v', '--verbose',
-                        help='Print more status information. For every ' +
-                             'additional time this flag is specified, ' +
-                             'output gets more verbose.',
-                        default=0, action='count')
-    parser.add_argument('--version', action='version',
-                        version='%(prog)s {0}'.format(__version__))
-    args = parser.parse_args(argv)
-    args.page_size = max(100, args.page_size)
-    return args
 
 
 def get_or_create_stash_proj_key(key_set, names_to_keys, proj_name, stash, stash_project_names):
@@ -220,7 +173,7 @@ def push_to_stash(failed_to_clone, gitlab_proj, skipped_count, stash_repo_url, t
     return skipped_count, transfer_count
 
 
-def main(argv=None):
+def main(args):
     """
     Process the command line arguments and create the JSON dump.
 
@@ -228,8 +181,6 @@ def main(argv=None):
                  If None, ``sys.argv[1:]`` is used instead.
     :type argv: list of str
     """
-
-    args = parse_args(argv)
 
     # Convert verbose flag to actually logging level
     log_levels = [logging.WARNING, logging.INFO, logging.DEBUG]
@@ -239,7 +190,7 @@ def main(argv=None):
     logging.basicConfig(format=('%(asctime)s - %(name)s - %(levelname)s - ' +
                                 '%(message)s'), level=log_level)
 
-    gitlab, stash = setup(args)
+    gitlab, stash = init_api_instance(args)
 
     print('Retrieving existing Stash projects...', end="", file=sys.stderr)
     sys.stderr.flush()
@@ -258,7 +209,7 @@ def main(argv=None):
     sys.stderr.flush()
 
     for gitlab_proj in gen_all_results(gitlab.getallprojects,
-                                      per_page=args.page_size):
+                                       per_page=args.page_size):
         print('\n' + ('=' * 80) + '\n', file=sys.stderr)
         sys.stderr.flush()
         proj_name = gitlab_proj['namespace']['name']
@@ -306,4 +257,47 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    main()
+    # Get command line arguments
+    parser = argparse.ArgumentParser(
+        description="Transfer all projects/repositories from GitLab to Stash. \
+                     Note: This script assumes you have your SSH key \
+                     registered with both GitLab and Stash.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        conflict_handler='resolve')
+    parser.add_argument('gitlab_url',
+                        help='The full URL to your GitLab instance.')
+    parser.add_argument('stash_url',
+                        help='The full URL to your Stash instance.')
+    parser.add_argument('-p', '--password',
+                        help='The password to use to authenticate if token is \
+                              not specified. If password and token are both \
+                              unspecified, you will be prompted to enter a \
+                              password.')
+    parser.add_argument('-P', '--page_size',
+                        help='When retrieving result from GitLab, how many \
+                              results should be included in a given page?.',
+                        type=int, default=20)
+    parser.add_argument('-s', '--verify_ssl',
+                        help='Enable SSL certificate verification',
+                        action='store_true')
+    parser.add_argument('-S', '--skip_existing',
+                        help='Do not update existing repositories and just \
+                              skip them.',
+                        action='store_true')
+    parser.add_argument('-t', '--token',
+                        help='The private GitLab API token to use for \
+                              authentication. Either this or username and \
+                              password must be set.')
+    parser.add_argument('-u', '--username',
+                        help='The username to use for authentication, if token\
+                              is unspecified.')
+    parser.add_argument('-v', '--verbose',
+                        help='Print more status information. For every ' +
+                             'additional time this flag is specified, ' +
+                             'output gets more verbose.',
+                        default=0, action='count')
+    parser.add_argument('--version', action='version',
+                        version='%(prog)s {0}'.format(__version__))
+    args = parser.parse_args(sys.argv)
+    args.page_size = max(100, args.page_size)
+    main(args)
