@@ -10,7 +10,6 @@ Clone all projects from GitLab and recreate them on Stash
 
 import argparse
 import getpass
-import logging
 import os
 import re
 import subprocess
@@ -20,11 +19,19 @@ import tempfile
 import stashy
 from gitlab import Gitlab as GitLabAPI
 
+from mapping import namespace_to_project
 
 __version__ = '0.1.0'
 
 
-def gen_all_results(method, *args, per_page=20, **kwargs):
+def get_gitlab_info(file='gitlab.csv'):
+    import csv
+    reader = csv.reader(open(file, 'r'))
+    for i in reader:
+        yield dict(namespace=dict(name=i[0]), name=i[1], ssh_url_to_repo=i[2], name_with_namespace=i[3])
+
+
+def gen_all_results(method, per_page=20, *args, **kwargs):
     """
     Little helper function to generate all pages of results for a given method
     in one list.
@@ -39,7 +46,7 @@ def gen_all_results(method, *args, per_page=20, **kwargs):
         # proj_page will be False if method fails
         if proj_page:
             get_more = len(proj_page) == per_page
-            yield from iter(proj_page)
+            yield iter(proj_page)
         else:
             get_more = False
 
@@ -48,7 +55,7 @@ def init_api_instance(args):
     # Setup authenticated GitLab and Stash instances
     if args.token:
         gitlab = GitLabAPI(args.gitlab_url, token=args.token,
-                           verify_ssl=args.verify_ssl)
+                           verify_ssl=args.unverify_ssl)
     else:
         gitlab = None
     if not args.username:
@@ -56,9 +63,9 @@ def init_api_instance(args):
         args.username = input('').strip()
     if not args.password:
         args.password = getpass.getpass('Password: ')
-    stash = stashy.connect(args.stash_url, args.username, args.password)
+    stash = stashy.connect(args.stash_url, args.username, args.password, args.unverify_ssl)
     if gitlab is None:
-        gitlab = GitLabAPI(args.gitlab_url, verify_ssl=args.verify_ssl)
+        gitlab = GitLabAPI(args.gitlab_url, verify_ssl=args.unverify_ssl)
         gitlab.login(args.username, args.password)
     return gitlab, stash
 
@@ -174,21 +181,6 @@ def push_to_stash(failed_to_clone, gitlab_proj, skipped_count, stash_repo_url, t
 
 
 def main(args):
-    """
-    Process the command line arguments and create the JSON dump.
-
-    :param argv: List of arguments, as if specified on the command-line.
-                 If None, ``sys.argv[1:]`` is used instead.
-    :type argv: list of str
-    """
-
-    # Convert verbose flag to actually logging level
-    log_levels = [logging.WARNING, logging.INFO, logging.DEBUG]
-    log_level = log_levels[min(args.verbose, 2)]
-    # Make warnings from built-in warnings module get formatted more nicely
-    logging.captureWarnings(True)
-    logging.basicConfig(format=('%(asctime)s - %(name)s - %(levelname)s - ' +
-                                '%(message)s'), level=log_level)
 
     gitlab, stash = init_api_instance(args)
 
@@ -208,11 +200,12 @@ def main(args):
     print('Processing GitLab projects...', file=sys.stderr)
     sys.stderr.flush()
 
-    for gitlab_proj in gen_all_results(gitlab.getallprojects,
-                                       per_page=args.page_size):
+    for gitlab_proj in get_gitlab_info():
         print('\n' + ('=' * 80) + '\n', file=sys.stderr)
         sys.stderr.flush()
-        proj_name = gitlab_proj['namespace']['name']
+        # mapping from GitLab namespace to Stash project
+        proj_name = namespace_to_project[gitlab_proj['namespace']['name']]
+
         stash_proj_key = get_or_create_stash_proj_key(key_set, names_to_keys, proj_name, stash, stash_project_names)
 
         stash_project = stash.projects[stash_proj_key]
@@ -277,9 +270,9 @@ if __name__ == '__main__':
                         help='When retrieving result from GitLab, how many \
                               results should be included in a given page?.',
                         type=int, default=20)
-    parser.add_argument('-s', '--verify_ssl',
+    parser.add_argument('-s', '--unverify_ssl',
                         help='Enable SSL certificate verification',
-                        action='store_true')
+                        action='store_false')
     parser.add_argument('-S', '--skip_existing',
                         help='Do not update existing repositories and just \
                               skip them.',
@@ -298,6 +291,6 @@ if __name__ == '__main__':
                         default=0, action='count')
     parser.add_argument('--version', action='version',
                         version='%(prog)s {0}'.format(__version__))
-    args = parser.parse_args(sys.argv)
-    args.page_size = max(100, args.page_size)
-    main(args)
+    arguments = parser.parse_args()
+    arguments.page_size = max(100, arguments.page_size)
+    main(arguments)
